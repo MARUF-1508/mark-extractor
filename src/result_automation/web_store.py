@@ -15,9 +15,9 @@ from pathlib import Path
 
 from PIL import Image
 
-from .document import SUPPORTED, open_document
+from .document import SUPPORTED, open_document, reocr_pages
 from .extract import extract_document, extract_page, validate
-from .models import Cancelled, Document, ExportColumn, Layout, Page, Record, Word
+from .models import Cancelled, Document, ExportColumn, Layout, MarkCandidate, Page, Record, Word
 from .storage import save_session
 
 LOG = logging.getLogger(__name__)
@@ -49,6 +49,7 @@ class JobStore:
         self.lock = threading.RLock()
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="result-extraction")
         self.cancellations: dict[str, threading.Event] = {}
+        self.passwords: dict[str, str | None] = {}
         for meta_path in self.root.glob("*/meta.json"):
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -62,6 +63,7 @@ class JobStore:
     def close(self):
         for event in list(self.cancellations.values()):
             event.set()
+        self.passwords.clear()
         self.worker.shutdown(wait=True, cancel_futures=True)
 
     def folder(self, job_id: str) -> Path:
@@ -99,18 +101,19 @@ class JobStore:
         })
         return job_id, folder / filename
 
-    def submit(self, job_id: str):
+    def submit(self, job_id: str, password: str | None = None):
         self.cancellations[job_id] = threading.Event()
+        self.passwords[job_id] = password or None
         self.update_meta(job_id, status="queued", progress="Waiting for the local extraction engine…")
         self.worker.submit(self._extract, job_id)
 
-    def import_file(self, source: Path, force_ocr=False) -> str:
+    def import_file(self, source: Path, force_ocr=False, password: str | None = None) -> str:
         job_id, target = self.reserve(source.name, force_ocr)
         try:
             if source.stat().st_size > MAX_UPLOAD_BYTES:
                 raise StoreError(413, "The file exceeds the 50 MB limit.")
             shutil.copyfile(source, target)
-            self.submit(job_id)
+            self.submit(job_id, password)
         except Exception:
             shutil.rmtree(target.parent, ignore_errors=True)
             raise
@@ -118,15 +121,20 @@ class JobStore:
 
     def _extract(self, job_id: str):
         event = self.cancellations[job_id]
+        password = self.passwords.pop(job_id, None)
         try:
             if event.is_set():
                 raise Cancelled()
             meta = self.update_meta(job_id, status="processing", progress="Opening document…")
             document = open_document(self.folder(job_id) / meta["filename"], force_ocr=meta["force_ocr"],
-                                     cancel=event, max_pages=MAX_PAGES,
+                                     password=password, cancel=event, max_pages=MAX_PAGES,
                                      progress=lambda text: self.update_meta(job_id, progress=text))
             self.update_meta(job_id, progress="Pairing rolls and marks by row…")
             extract_document(document)
+            if not document.records and any(page.method == "PDF text" for page in document.pages):
+                self.update_meta(job_id, progress="PDF text looked unusable; trying local image OCR…")
+                reocr_pages(document, progress=lambda text: self.update_meta(job_id, progress=text))
+                extract_document(document)
             if event.is_set():
                 raise Cancelled()
             pages_dir = self.folder(job_id) / "pages"
@@ -167,15 +175,18 @@ class JobStore:
             else:
                 preview = Image.new("RGB", (1, 1))
             pages.append(Page(saved["number"], preview, [Word(**w) for w in saved["words"]], saved["method"],
-                              Layout(**saved["layout"]) if saved["layout"] else None))
+                              Layout(**saved["layout"]) if saved["layout"] else None,
+                              [MarkCandidate(**c) for c in saved.get("mark_candidates", [])],
+                              saved.get("notes", [])))
         return Document(folder / self.meta(job_id)["filename"], pages, [Record(**r) for r in payload["records"]],
                         payload["max_mark"], payload.get("warnings", []), payload["source_sha256"],
                         [ExportColumn(**c) for c in payload["export_columns"]] if payload.get("export_columns") is not None else None,
-                        payload.get("export_overrides", {}))
+                        payload.get("export_overrides", {}), payload.get("absent_codes", []),
+                        payload.get("allow_fractions", True))
 
     def save_document(self, job_id: str, document: Document):
         validate(document)
-        save_session(document, self.folder(job_id) / "review.json")
+        save_session(document, self.folder(job_id) / "review.json", verify_source=False)
         meta = self.meta(job_id)
         # Dimensions are immutable. Keep them in metadata so normal reads never
         # open/deserialize full-resolution page images.
@@ -191,12 +202,14 @@ class JobStore:
             if meta["status"] == "ready" and full:
                 document = self.load_document(job_id)
                 result.update(max_mark=document.max_mark, warnings=document.warnings,
+                              absent_codes=document.absent_codes, allow_fractions=document.allow_fractions,
                               export_columns=[asdict(c) for c in document.export_columns] if document.export_columns is not None else None,
                               records=[dict(asdict(r), status=r.status) for r in document.records],
                               verified_count=sum(r.reviewed and not r.issues for r in document.records),
-                              pages=[{"number": p.number, "method": p.method,
+                              pages=[{"number": p.number, "method": p.method, "notes": p.notes,
                                       "width": meta["dimensions"][i][0], "height": meta["dimensions"][i][1],
                                       "layout": asdict(p.layout) if p.layout else None,
+                                      "mark_candidates": [asdict(c) for c in p.mark_candidates],
                                       "image_url": f"/api/documents/{job_id}/pages/{p.number}.png"}
                                      for i, p in enumerate(document.pages)])
             return result
@@ -234,40 +247,46 @@ class JobStore:
             old_pages = {row.id: row.page for row in document.records}
             if not 1 <= page_number <= len(document.pages):
                 raise StoreError(404, "Page not found.")
-            if scope == "auto":
-                extract_document(document)
+        if scope == "auto":
+            extract_document(document)
+        else:
+            if layout is None:
+                raise StoreError(422, "Select roll and marks columns first.")
+            page = document.pages[page_number - 1]
+            page.layout = layout
+            if scope == "all":
+                for other in document.pages:
+                    if other is page:
+                        continue
+                    if other.layout is None:
+                        other.layout = deepcopy(layout)
+                        other.layout.top = 0
+                    other.layout.roll, other.layout.mark = layout.roll, layout.mark
+                    other.layout.label, other.layout.max_mark = layout.label, layout.max_mark
+                    other.layout.automatic = False
+                extract_document(document, autodetect=False)
             else:
-                if layout is None:
-                    raise StoreError(422, "Select roll and marks columns first.")
-                page = document.pages[page_number - 1]
-                page.layout = layout
-                if scope == "all":
-                    for other in document.pages:
-                        if other is page:
-                            continue
-                        if other.layout is None:
-                            other.layout = deepcopy(layout)
-                            other.layout.top = 0
-                        other.layout.roll, other.layout.mark = layout.roll, layout.mark
-                        other.layout.label, other.layout.max_mark = layout.label, layout.max_mark
-                        other.layout.automatic = False
-                    extract_document(document, autodetect=False)
-                else:
-                    document.records = [r for r in document.records if r.page != page_number] + extract_page(page)
-                    document.records.sort(key=lambda r: (r.page, r.box[1]))
-                    document.warnings = [w for w in document.warnings if not w.startswith(f"Page {page_number}:")]
-                    if not any(r.page == page_number for r in document.records):
-                        document.warnings.append(f"Page {page_number}: no rows found. Check your selection.")
-            if scope in {"auto", "all"}:
-                document.export_overrides.clear()
-            else:
-                document.export_overrides = {key: value for key, value in document.export_overrides.items()
-                                             if old_pages.get(key) != page_number}
-            if document.export_columns:
-                from .columns import default_columns
-                defaults = {c.source: c for c in default_columns(document)}
-                for column in document.export_columns:
-                    if column.source in defaults:
-                        column.regions = defaults[column.source].regions
+                document.records = [r for r in document.records if r.page != page_number] + extract_page(page)
+                document.records.sort(key=lambda r: (r.page, r.box[1]))
+                document.warnings = [w for w in document.warnings if not w.startswith(f"Page {page_number}:")]
+                if not any(r.page == page_number for r in document.records):
+                    document.warnings.append(f"Page {page_number}: no rows found. Check your selection.")
+        if scope in {"auto", "all"}:
+            document.export_overrides.clear()
+        else:
+            document.export_overrides = {key: value for key, value in document.export_overrides.items()
+                                         if old_pages.get(key) != page_number}
+        if document.export_columns:
+            from .columns import default_columns
+            defaults = {c.source: c for c in default_columns(document)}
+            for column in document.export_columns:
+                if column.source in defaults:
+                    column.regions = defaults[column.source].regions
+        with self.lock:
+            current = self.meta(job_id)
+            if current["status"] != "ready":
+                raise StoreError(409, "Wait for extraction to finish before editing or exporting.")
+            if current["version"] != version:
+                raise StoreError(409, "This document changed in another tab. Refresh it before saving your changes.")
             self.save_document(job_id, document)
             return self.view(job_id)

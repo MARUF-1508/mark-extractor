@@ -11,8 +11,46 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .models import Cancelled, Document, Page, Progress, Word
 from .ocr import LocalOCR
+from .preprocess import orient_image, preprocess_image
 
 SUPPORTED = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+
+
+def text_is_usable(words: list[Word]) -> bool:
+    text = "".join(word.text for word in words)
+    chars = len("".join(text.split()))
+    numeric = sum(any(character.isdigit() for character in word.text) for word in words)
+    damaged = text.count("\ufffd")
+    return chars >= 20 and (numeric >= 8 or chars >= 160) and damaged <= max(3, chars * .05)
+
+
+def ocr_score(words: list[Word]) -> float:
+    if not words:
+        return 0.0
+    characters = sum(len(word.text.strip()) for word in words)
+    return characters * (sum(word.confidence for word in words) / len(words))
+
+
+def recognize_page(page: Page, ocr: LocalOCR, *, perspective: bool = False,
+                   progress: Progress = lambda _: None) -> list[str]:
+    image, notes = preprocess_image(page.image, perspective=perspective)
+    words = ocr.recognize(image)
+    if ocr_score(words) < 30 or not words:
+        if progress:
+            progress("Checking page orientation…")
+        image, angle = orient_image(image, ocr.recognize)
+        if angle:
+            words = ocr.recognize(image)
+            notes.append(f"rotated {angle:g}°")
+    page.image, page.words, page.method = image, words, "Local OCR"
+    page.notes = notes
+    return notes
+
+
+def reocr_page(page: Page, ocr: LocalOCR | None = None) -> list[Word]:
+    engine = ocr or LocalOCR()
+    recognize_page(page, engine, progress=lambda _: None)
+    return page.words
 
 
 def pdf_words(page) -> list[Word]:
@@ -67,7 +105,7 @@ def pdf_words(page) -> list[Word]:
     return words
 
 
-def open_document(path: str | Path, *, force_ocr: bool = False,
+def open_document(path: str | Path, *, force_ocr: bool = False, password: str | None = None,
                   progress: Progress = lambda _: None, cancel: Event | None = None,
                   read_words: bool = True, max_pages: int | None = None) -> Document:
     path = Path(path).resolve()
@@ -86,8 +124,13 @@ def open_document(path: str | Path, *, force_ocr: bool = False,
 
     if path.suffix.lower() == ".pdf":
         try:
-            pdf = pdfium.PdfDocument(path)
+            pdf = pdfium.PdfDocument(path, password=password or None)
         except pdfium.PdfiumError as exc:
+            message = str(exc).lower()
+            if getattr(exc, "err_code", None) == getattr(pdfium_raw, "FPDF_ERR_PASSWORD", 4) or "password" in message:
+                if password:
+                    raise ValueError("The PDF password is incorrect.") from exc
+                raise ValueError("This PDF is password protected. Add its password in the upload dialog.") from exc
             raise ValueError("Cannot open this PDF. It may be damaged or password protected.") from exc
         try:
             if max_pages is not None and len(pdf) > max_pages:
@@ -99,20 +142,21 @@ def open_document(path: str | Path, *, force_ocr: bool = False,
                 try:
                     words = pdf_words(page) if read_words and not force_ocr else []
                     # 200 DPI for OCR; enough pixels for small decimal marks.
-                    scale = min(200 / 72, 3000 / max(page.get_size()))
+                    width, height = page.get_size()
+                    scale = min(200 / 72, 3000 / max(1.0, width, height))
                     bitmap = page.render(scale=scale)
                     image = bitmap.to_pil().convert("RGB")
                     bitmap.close()
                 finally:
                     page.close()
-                method = "PDF text"
-                # A scanned page can still have an embedded footer/header. Require
-                # enough numeric tokens before choosing the text-only path.
-                numeric_count = sum(any(c.isdigit() for c in word.text) for word in words)
-                if read_words and (force_ocr or numeric_count < 8):
+                method, notes = "PDF text", []
+                if read_words and (force_ocr or not text_is_usable(words)):
                     progress(f"Recognizing page {index + 1} locally…")
-                    words, method = ocr.recognize(image), "Local OCR"
-                pages.append(Page(index + 1, image, words, method))
+                    rendered = Page(index + 1, image, [], "Local OCR")
+                    notes = recognize_page(rendered, ocr, progress=progress)
+                    image, words = rendered.image, rendered.words
+                    method = rendered.method
+                pages.append(Page(index + 1, image, words, method, notes=notes))
         finally:
             pdf.close()
     else:
@@ -126,9 +170,19 @@ def open_document(path: str | Path, *, force_ocr: bool = False,
                     image = ImageOps.exif_transpose(image_file.copy()).convert("RGB")
                     image.thumbnail((3000, 3000), Image.Resampling.LANCZOS)
                     progress(f"Recognizing image {index + 1} locally…")
-                    words = ocr.recognize(image) if read_words else []
-                    pages.append(Page(index + 1, image, words, "Local OCR"))
+                    page = Page(index + 1, image, [], "Local OCR")
+                    if read_words:
+                        recognize_page(page, ocr, perspective=True, progress=progress)
+                    pages.append(page)
         except UnidentifiedImageError as exc:
             raise ValueError("This image is damaged or uses an unsupported format.") from exc
     check_cancel()
     return Document(path, pages, source_sha256=source_digest)
+
+
+def reocr_pages(document: Document, ocr: LocalOCR | None = None,
+                progress: Progress = lambda _: None) -> None:
+    engine = ocr or LocalOCR()
+    for page in document.pages:
+        progress(f"Recognizing page {page.number} locally…")
+        recognize_page(page, engine, progress=progress)

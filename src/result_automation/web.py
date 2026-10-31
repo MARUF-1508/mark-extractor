@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from starlette.background import BackgroundTask
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .extract import normalize, validate
+from .extract import LOW_CONFIDENCE, normalize, validate
 from .models import ExportColumn, Layout, Record
 from .columns import apply_export_plan, discover_columns, table_preview
 from .storage import export_csv, export_xlsx
@@ -47,6 +47,20 @@ class RowAdd(RowEdit):
 
 class SettingsEdit(Versioned):
     max_mark: float | None = Field(default=None, gt=0)
+    absent_codes: list[Annotated[str, Field(max_length=16)]] | None = Field(default=None, max_length=20)
+    allow_fractions: bool | None = None
+
+    @field_validator("absent_codes")
+    @classmethod
+    def clean_absent_codes(cls, codes):
+        if codes is None:
+            return None
+        cleaned = []
+        for code in codes:
+            value = code.strip()
+            if value and value not in cleaned:
+                cleaned.append(value)
+        return cleaned
 
 
 class LayoutEdit(BaseModel):
@@ -167,12 +181,16 @@ def create_app(data_dir: str | Path | None = None, *, initial_source: Path | Non
         response.headers["Referrer-Policy"] = "same-origin"
         response.headers["X-Frame-Options"] = "SAMEORIGIN"
         if request.url.path.startswith("/api/"):
-            response.headers["Cache-Control"] = "no-store"
+            if "/pages/" in request.url.path or request.url.path.endswith("/source"):
+                response.headers["Cache-Control"] = "private, max-age=3600"
+            else:
+                response.headers["Cache-Control"] = "no-store"
         return response
 
     @app.get("/api/health")
     def health():
-        return {"status": "ok", "storage": "local", "max_upload_mb": 50, "max_pages": MAX_PAGES}
+        return {"status": "ok", "storage": "local", "max_upload_mb": 50, "max_pages": MAX_PAGES,
+                "low_confidence_threshold": LOW_CONFIDENCE}
 
     @app.get("/api/examples")
     def examples():
@@ -191,7 +209,8 @@ def create_app(data_dir: str | Path | None = None, *, initial_source: Path | Non
         return store.list()
 
     @app.post("/api/documents", status_code=202)
-    async def upload(file: Annotated[UploadFile, File()], force_ocr: Annotated[bool, Form()] = False):
+    async def upload(file: Annotated[UploadFile, File()], force_ocr: Annotated[bool, Form()] = False,
+                     password: Annotated[str | None, Form()] = None):
         job_id = None
         try:
             job_id, target = store.reserve(file.filename or "marksheet", force_ocr)
@@ -204,7 +223,7 @@ def create_app(data_dir: str | Path | None = None, *, initial_source: Path | Non
                     stream.write(chunk)
             if not size:
                 raise StoreError(400, "The file is empty. Choose a PDF or image with a marksheet.")
-            store.submit(job_id)
+            store.submit(job_id, password)
             return store.view(job_id)
         except Exception:
             if job_id:
@@ -281,7 +300,12 @@ def create_app(data_dir: str | Path | None = None, *, initial_source: Path | Non
         with store.lock:
             store.require_ready(job_id, values.version)
             doc = store.load_document(job_id)
-            doc.max_mark = values.max_mark
+            if "max_mark" in values.model_fields_set:
+                doc.max_mark = values.max_mark
+            if values.absent_codes is not None:
+                doc.absent_codes = values.absent_codes
+            if values.allow_fractions is not None:
+                doc.allow_fractions = values.allow_fractions
             store.save_document(job_id, doc)
             return store.view(job_id)
 

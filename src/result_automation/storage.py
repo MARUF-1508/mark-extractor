@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .document import open_document
 from .extract import number, validate
-from .models import Document, ExportColumn, Layout, Record, Word
+from .models import Document, ExportColumn, Layout, MarkCandidate, Record, Word
 
 SCHEMA = "result-desk-session-v1"
 
@@ -18,17 +18,23 @@ def _digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def save_session(document: Document, path: str | Path) -> None:
-    source_digest = _digest(document.source)
-    if document.source_sha256 and source_digest != document.source_sha256:
+def save_session(document: Document, path: str | Path, *, verify_source: bool = True) -> None:
+    if verify_source or not document.source_sha256:
+        source_digest = _digest(document.source)
+    else:
+        source_digest = document.source_sha256
+    if verify_source and document.source_sha256 and source_digest != document.source_sha256:
         raise ValueError("The source document changed while you were reviewing it. Open the changed document again before saving.")
     payload = {
         "schema": SCHEMA,
         "source": str(document.source),
         "source_sha256": source_digest,
         "max_mark": document.max_mark,
+        "absent_codes": document.absent_codes,
+        "allow_fractions": document.allow_fractions,
         "warnings": document.warnings,
-        "pages": [{"number": p.number, "method": p.method,
+        "pages": [{"number": p.number, "method": p.method, "notes": p.notes,
+                   "mark_candidates": [asdict(c) for c in p.mark_candidates],
                    "layout": asdict(p.layout) if p.layout else None,
                    "words": [asdict(w) for w in p.words]} for p in document.pages],
         "records": [asdict(r) for r in document.records],
@@ -59,8 +65,12 @@ def load_session(path: str | Path) -> Document:
             page.method = saved["method"]
             page.layout = Layout(**saved["layout"]) if saved["layout"] else None
             page.words = [Word(**w) for w in saved["words"]]
+            page.mark_candidates = [MarkCandidate(**c) for c in saved.get("mark_candidates", [])]
+            page.notes = saved.get("notes", [])
         document.records = [Record(**row) for row in payload["records"]]
         document.max_mark = payload["max_mark"]
+        document.absent_codes = payload.get("absent_codes", [])
+        document.allow_fractions = payload.get("allow_fractions", True)
         document.warnings = payload.get("warnings", [])
         document.export_columns = ([ExportColumn(**c) for c in payload["export_columns"]]
                                    if payload.get("export_columns") is not None else None)

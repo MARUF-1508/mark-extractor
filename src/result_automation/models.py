@@ -37,12 +37,26 @@ class Layout:
 
 
 @dataclass
+class MarkCandidate:
+    id: str
+    label: str
+    left: float
+    right: float
+    top: float
+    bottom: float
+    max_mark: float | None = None
+    score: float = 0.0
+
+
+@dataclass
 class Page:
     number: int
     image: Image.Image
     words: list[Word]
     method: str
     layout: Layout | None = None
+    mark_candidates: list[MarkCandidate] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -84,6 +98,8 @@ class Document:
     source_sha256: str = ""
     export_columns: list[ExportColumn] | None = None
     export_overrides: dict[str, dict[str, str]] = field(default_factory=dict)
+    absent_codes: list[str] = field(default_factory=list)
+    allow_fractions: bool = True
 
 
 class Cancelled(Exception):

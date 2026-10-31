@@ -8,10 +8,13 @@ from statistics import median
 
 import cv2
 import numpy as np
+from PIL import Image
 
-from .models import Document, Layout, Page, Record, Word
+from .models import Document, Layout, MarkCandidate, Page, Record, Word
 
 DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
+LOW_CONFIDENCE = 0.7
+RETRY_ISSUES = ("Mark exceeds", "Mark is not a number", "Roll must contain digits only")
 
 
 def normalize(text: str) -> str:
@@ -75,6 +78,70 @@ def group_lines(words: list[Word]) -> list[list[Word]]:
     return [sorted(line, key=lambda w: w.box[0]) for line in lines]
 
 
+HEADER_WEIGHTS = (
+    ("total", 5.0), ("marks", 4.0), ("mark", 3.0), ("score", 4.0), ("obtained", 4.0),
+    ("project", 3.0), ("exam", 1.0), ("average", 1.0), ("avg", 1.0),
+    ("grade", -6.0), ("letter", -4.0), ("roll", -5.0), ("serial", -5.0),
+    ("name", -3.0), ("attendance", -1.0),
+)
+
+
+def _header_near(page: Page, left: float, right: float, top: float, bottom: float):
+    nearby = [w for w in page.words if left <= w.cx <= right and top <= w.cy < bottom]
+    if not nearby:
+        return "", None
+    rotated = any(w.box[3] - w.box[1] > (w.box[2] - w.box[0]) * 1.5 for w in nearby)
+    text = " ".join(w.text for w in (nearby if rotated
+                                    else sorted(nearby, key=lambda w: (round(w.cy, 2), w.cx)))).strip()
+    match = re.search(r"\(\s*([0-9]+(?:\.[0-9]+)?)(?:\s+Marks?)?\s*\)", text, re.I)
+    return re.sub(r"\s+", " ", text), (float(match[1]) if match else None)
+
+
+def _candidate_columns(page: Page, xs: list[float], roll: tuple[float, float],
+                       top: float, bottom: float, header_top: float, header_bottom: float,
+                       previous: Layout | None) -> list[MarkCandidate]:
+    candidates: list[MarkCandidate] = []
+    body = [w for w in page.words if top <= w.cy <= bottom]
+    columns = list(zip(xs, xs[1:])) if len(xs) >= 3 else []
+    for index, (left, right) in enumerate(columns):
+        center = (left + right) / 2
+        if roll[0] <= center <= roll[1] or right - left < .015:
+            continue
+        inside = [w for w in body if left <= w.cx < right]
+        numeric = [w for w in inside if number(w.text) is not None]
+        label, maximum = _header_near(page, left, right, header_top, header_bottom)
+        lowered = label.lower()
+        header_score = sum(weight for needle, weight in HEADER_WEIGHTS if needle in lowered)
+        ratio = len(numeric) / len(inside) if inside else 0.0
+        score = header_score + min(len(numeric), 30) / 10 + ratio * 2 + max(0.0, center - .5) * 2
+        if not numeric and header_score <= 0:
+            continue
+        candidates.append(MarkCandidate(f"mark-{index}", label or f"Column {index + 1}",
+                                        max(0.0, left), min(1.0, right), top, bottom,
+                                        maximum, score))
+    if not columns:
+        numeric = [w for w in body if number(w.text) is not None and w.cx > .5]
+        clusters: list[list[Word]] = []
+        for word in sorted(numeric, key=lambda w: w.cx):
+            if not clusters or abs(word.cx - median(w.cx for w in clusters[-1])) > .03:
+                clusters.append([])
+            clusters[-1].append(word)
+        for index, cluster in enumerate(clusters):
+            center = median(w.cx for w in cluster)
+            label, maximum = _header_near(page, max(0.0, center - .05), min(1.0, center + .05),
+                                          header_top, header_bottom)
+            candidates.append(MarkCandidate(f"mark-{index}", label or "Marks",
+                                            max(0.0, center - .05), min(1.0, center + .05),
+                                            top, bottom, maximum, len(cluster) + center))
+    if not candidates:
+        mark = previous.mark if previous else None
+        if mark:
+            label, maximum = (previous.label, previous.max_mark) if previous else ("Marks", None)
+            candidates.append(MarkCandidate("mark-previous", label, mark[0], mark[1], top, bottom,
+                                            maximum, 1.0))
+    return sorted(candidates, key=lambda candidate: candidate.score, reverse=True)[:6]
+
+
 def detect_layout(page: Page, previous: Layout | None = None,
                   grid: tuple[list[float], list[float]] | None = None) -> Layout:
     xs, ys = grid if grid is not None else detect_grid(page)
@@ -100,38 +167,45 @@ def detect_layout(page: Page, previous: Layout | None = None,
         best = max(clusters, key=lambda c: (len(c), -median(w.cx for w in c)))
         roll = _column(median(w.cx for w in best), xs, 0.055)
         header_y = None
-    if len(xs) >= 3:
-        mark = xs[-2], xs[-1]
+    top, bottom = (ys[0], ys[-1]) if len(ys) >= 2 else (0.0, 0.98)
+    if header_y is not None:
+        above = [y for y in ys if y < header_y]
+        below = [y for y in ys if y > header_y + 0.003]
+        header_top = max(above) if above else header.box[1] - 0.02
+        header_bottom = min(below) if below else header.box[3] + 0.004
+        top = min(below) if below else header.box[3] + 0.004
+    else:
+        header_top = max(0.0, top - .08)
+        header_bottom = top
+    candidates = _candidate_columns(page, xs, roll, top, bottom, header_top, header_bottom, previous)
+    if candidates:
+        chosen = candidates[0]
+        mark = chosen.left, chosen.right
+        label, maximum = chosen.label, chosen.max_mark
+        if header is None and previous and (not chosen.label or chosen.label.startswith("Column ")
+                                            or chosen.label in {"Marks", "Rightmost marks"}):
+            label, maximum = previous.label, previous.max_mark
     elif previous:
         mark = previous.mark
+        label, maximum = previous.label, previous.max_mark
     else:
         numeric = [w for w in page.words if number(w.text) is not None and w.cx > 0.5]
         if not numeric:
             raise ValueError(f"Page {page.number}: could not locate the marks column.")
         rightmost = max(w.cx for w in numeric)
         mark = max(0.0, rightmost - 0.045), min(1.0, rightmost + 0.045)
-    top, bottom = (ys[0], ys[-1]) if len(ys) >= 2 else (0.0, 0.98)
-    label, maximum = (previous.label, previous.max_mark) if previous else ("Rightmost marks", None)
-    if header_y is not None:
-        above = [y for y in ys if y < header_y]
-        below = [y for y in ys if y > header_y + 0.003]
-        header_top = max(above) if above else header.box[1] - 0.02
-        header_bottom = min(below) if below else header.box[3] + 0.004
-        nearby = [w for w in page.words if mark[0] <= w.cx <= mark[1]
-                  and header_top <= w.cy < header_bottom]
-        if nearby:
-            rotated = any(w.box[3] - w.box[1] > (w.box[2] - w.box[0]) * 1.5 for w in nearby)
-            label = " ".join(w.text for w in (nearby if rotated else sorted(nearby, key=lambda w: (round(w.cy, 2), w.cx))))
-            match = re.search(r"\(\s*([0-9]+(?:\.[0-9]+)?)(?:\s+Marks?)?\s*\)", label, re.I)
-            maximum = float(match[1]) if match else None
-        top = min(below) if below else header.box[3] + 0.004
+        label, maximum = "Rightmost marks", None
+    page.mark_candidates = candidates
     return Layout(roll, mark, top, bottom, label, maximum)
 
 
-def _cell(words: list[Word], bounds: tuple[float, float]) -> tuple[str, float]:
+def _cell(words: list[Word], bounds: tuple[float, float], *, numeric: bool = False) -> tuple[str, float]:
     selected = sorted((w for w in words if bounds[0] < w.cx < bounds[1]), key=lambda w: w.cx)
-    # OCR may separate the decimal dot. Join pieces within the same cell only.
-    return "".join(w.text for w in selected).strip(), min((w.confidence for w in selected), default=0.0)
+    if numeric:
+        text = "".join(w.text for w in selected)
+    else:
+        text = " ".join(w.text for w in selected)
+    return text.strip(), min((w.confidence for w in selected), default=0.0)
 
 
 def extract_page(page: Page) -> list[Record]:
@@ -153,8 +227,8 @@ def extract_page(page: Page) -> list[Record]:
                           max(w.box[3] for w in line) + 0.003, line))
     records = []
     for top, bottom, words in bands:
-        raw_roll, roll_score = _cell(words, layout.roll)
-        raw_mark, mark_score = _cell(words, layout.mark)
+        raw_roll, roll_score = _cell(words, layout.roll, numeric=True)
+        raw_mark, mark_score = _cell(words, layout.mark, numeric=True)
         # Exclude page furniture and repeated headers. Ruled rows with a name or
         # mark remain visible even when OCR misses the roll entirely.
         if re.search(r"roll|total|project|attendance", raw_roll, re.I):
@@ -173,6 +247,23 @@ def extract_page(page: Page) -> list[Record]:
     return records
 
 
+def _fraction(text: str):
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*/\s*([0-9]+(?:\.[0-9]+)?)", normalize(text))
+    if not match:
+        return None
+    return Decimal(match[1]), Decimal(match[2])
+
+
+def _absent(document: Document, text: str) -> bool:
+    wanted = normalize(text).casefold()
+    return bool(wanted) and wanted in {normalize(code).casefold() for code in document.absent_codes}
+
+
+def _readable_mark(document: Document, text: str) -> bool:
+    return bool(text) and (number(text) is not None or _absent(document, text)
+                           or (document.allow_fractions and _fraction(text) is not None))
+
+
 def validate(document: Document) -> None:
     counts = Counter(row.roll for row in document.records if valid_roll(row.roll))
     for row in document.records:
@@ -181,10 +272,26 @@ def validate(document: Document) -> None:
             row.issues.append("Missing roll" if not row.roll else "Roll must contain digits only")
         elif counts[row.roll] > 1:
             row.issues.append("Duplicate roll")
-        value = number(row.mark)
-        if value is None:
-            row.issues.append("Missing mark" if not row.mark or re.fullmatch(r"[-–—]+", row.mark)
-                              else "Mark is not a number")
+        raw_mark = normalize(row.mark)
+        value = number(raw_mark)
+        fraction = _fraction(raw_mark) if document.allow_fractions else None
+        if not raw_mark:
+            row.issues.append("Missing mark")
+        elif _absent(document, raw_mark):
+            pass
+        elif re.fullmatch(r"[-–—]+", raw_mark):
+            row.issues.append("Missing mark")
+        elif value is None and fraction is None:
+            row.issues.append("Mark is not a number")
+        elif fraction is not None:
+            numerator, denominator = fraction
+            maximum = document.max_mark if document.max_mark is not None else row.max_mark
+            if denominator <= 0:
+                row.issues.append("Fraction denominator must be positive")
+            elif numerator > denominator:
+                row.issues.append("Fraction exceeds its total")
+            if maximum is not None and (numerator > Decimal(str(maximum)) or denominator > Decimal(str(maximum))):
+                row.issues.append(f"Mark exceeds {maximum:g}")
         elif value < 0:
             row.issues.append("Negative mark")
         else:
@@ -195,7 +302,67 @@ def validate(document: Document) -> None:
             row.issues.append("Verify OCR reading")
 
 
-def extract_document(document: Document, *, autodetect: bool = True) -> Document:
+def _crop_cell(image, x0: float, x1: float, y0: float, y1: float):
+    width, height = image.size
+    left = int(max(0.0, x0 - .006) * width)
+    right = int(min(1.0, x1 + .006) * width)
+    top = int(max(0.0, y0 - .004) * height)
+    bottom = int(min(1.0, y1 + .004) * height)
+    if right <= left or bottom <= top:
+        return None
+    crop = image.crop((left, top, right, bottom))
+    return crop.resize((max(1, crop.width * 3), max(1, crop.height * 3)),
+                       resample=Image.Resampling.LANCZOS)
+
+
+def refine_low_confidence(document: Document, ocr=None, *, threshold: float = LOW_CONFIDENCE,
+                          budget: int = 60) -> int:
+    rows = [row for row in document.records if row.method == "Local OCR" and not row.reviewed
+            and (row.confidence < threshold or any(issue.startswith(RETRY_ISSUES) for issue in row.issues))]
+    if not rows:
+        return 0
+    if ocr is None:
+        from .ocr import LocalOCR
+        ocr = LocalOCR()
+    changed = 0
+    for row in rows:
+        if budget <= 0:
+            break
+        page = document.pages[row.page - 1]
+        layout = page.layout
+        if layout is None:
+            continue
+        for field, bounds in (("roll", layout.roll), ("mark", layout.mark)):
+            if budget <= 0:
+                break
+            crop = _crop_cell(page.image, bounds[0], bounds[1], row.box[1], row.box[3])
+            if crop is None:
+                continue
+            budget -= 1
+            try:
+                words = ocr.recognize(crop)
+            except Exception:
+                continue
+            if not words:
+                continue
+            text = "".join(word.text for word in sorted(words, key=lambda word: (word.cy, word.cx))).strip()
+            score = sum(word.confidence for word in words) / len(words)
+            current = getattr(row, field)
+            valid = valid_roll(text) if field == "roll" else _readable_mark(document, text)
+            current_valid = valid_roll(current) if field == "roll" else _readable_mark(document, current)
+            if not text or not valid or text == current:
+                continue
+            if current_valid and not any(issue.startswith(RETRY_ISSUES) for issue in row.issues) \
+                    and score < row.confidence + .08:
+                continue
+            setattr(row, field, normalize(text))
+            row.confidence = max(row.confidence, score) if current_valid else score
+            changed += 1
+    return changed
+
+
+def extract_document(document: Document, *, autodetect: bool = True, refine: bool = True,
+                     ocr=None) -> Document:
     previous = None
     document.warnings = []
     document.records = []
@@ -212,4 +379,6 @@ def extract_document(document: Document, *, autodetect: bool = True) -> Document
             document.warnings.append(f"Page {page.number}: no rows found; check the column selection.")
         document.records.extend(records)
     validate(document)
+    if refine and refine_low_confidence(document, ocr):
+        validate(document)
     return document
