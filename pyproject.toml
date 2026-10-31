@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "result-automation"
+version = "0.3.0"
+description = "Local web app and backend for student roll and marks extraction"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "pypdfium2==5.14.0",
+  "Pillow==13.0.0",
+  "numpy==2.4.6",
+  "opencv-python-headless==5.0.0.93",
+  "rapidocr==3.10.0",
+  "onnxruntime==1.31.0",
+  "openpyxl>=3.1.5,<4",
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.30,<1",
+  "python-multipart>=0.0.20,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pyinstaller>=6,<7", "httpx>=0.27,<1"]
+
+[project.scripts]
+result-desk = "result_automation.entry:main"
+result-extract = "result_automation.cli:main"
+result-web = "result_automation.web:main"
+result-desktop = "result_automation.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+result_automation = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["ocr: runs the bundled CPU OCR models (slower)"]
