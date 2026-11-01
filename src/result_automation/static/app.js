@@ -269,7 +269,7 @@ function renderRows() {
   renderDetail();
 }
 
-function selectRow(id, scroll = false) {
+function selectRow(id, scroll = false, focus = false) {
   const row = state.doc?.records.find(record => record.id === id);
   if (!row) return;
   state.selected = id;
@@ -277,7 +277,21 @@ function selectRow(id, scroll = false) {
   state.page = row.page;
   renderRows(); renderPage();
   if (changedPage) $("pageViewport").scrollTop = 0;
-  if (scroll) $("tableBody").querySelector(`[data-row="${CSS.escape(id)}"]`)?.scrollIntoView({block:"nearest"});
+  const element = $("tableBody").querySelector(`[data-row="${CSS.escape(id)}"]`);
+  if (scroll) element?.scrollIntoView({block:"nearest"});
+  if (focus) element?.focus({preventScroll:true});
+}
+
+function moveSelection(position) {
+  const rows = filteredRows();
+  if (!rows.length) return;
+  const current = rows.findIndex(row => row.id === state.selected);
+  let index = current;
+  if (position === "first") index = 0;
+  else if (position === "last") index = rows.length - 1;
+  else if (position === "next") index = current < 0 ? 0 : Math.min(current + 1, rows.length - 1);
+  else if (position === "previous") index = current < 0 ? rows.length - 1 : Math.max(current - 1, 0);
+  selectRow(rows[index].id, true, true);
 }
 
 function renderDetail() {
@@ -622,6 +636,11 @@ document.addEventListener("keydown",event => {
   const typing = event.target.matches("input,textarea,select,[contenteditable]");
   if (event.key === "Escape") { state.selection = null; state.drag = null; $("moreMenu").hidden = true; renderPage(); }
   if (event.key === "/" && !typing && state.doc?.status === "ready") { event.preventDefault(); $("searchInput").focus(); }
+  const position = {ArrowDown:"next",ArrowUp:"previous",Home:"first",End:"last"}[event.key];
+  if (position && !typing && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && state.doc?.status === "ready") {
+    event.preventDefault();
+    moveSelection(position);
+  }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "e" && state.doc?.status === "ready") { event.preventDefault(); exportFile("xlsx"); }
   if (event.key.toLowerCase() === "r" && !typing && !event.ctrlKey && !event.metaKey && !event.altKey && state.doc?.status === "ready") {
     const row = currentRow();

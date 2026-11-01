@@ -47,7 +47,7 @@ python -m result_automation.web --data-dir ./my-local-reviews --port 8001
 - **Export Excel:** opens that same preview before downloading a real `.xlsx` workbook. The Results sheet contains exactly the selected headings and column order, with all student rows (including rows hidden by the main search/filter). Page, status, issues, and original readings stay on the separate Source and review sheet. The more menu also offers CSV through the same builder, and the original uploaded file.
 - **Add/delete:** add a student row when recognition missed it, remove an unwanted row from the editor, or delete a document and its saved review from the more menu. Deleting a document removes its uploaded copy; files outside the backend storage folder are untouched.
 
-Keyboard shortcuts: **R** or **Enter** marks the selected row reviewed, **/** focuses roll search, **Ctrl/Cmd+E** exports Excel, and **Esc** cancels column-drawing mode.
+Keyboard shortcuts: **↑/↓** moves the selected row through the current filter and sort, **Home/End** jumps to the first or last visible row, **R** or **Enter** marks the selected row reviewed, **/** focuses roll search, **Ctrl/Cmd+E** exports Excel, and **Esc** cancels column-drawing mode.
 
 ### Build an export
 
