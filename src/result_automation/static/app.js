@@ -259,8 +259,8 @@ function renderRows() {
     const low = needsConfidenceReview(row);
     const confidence = low ? `<span class="confidence-chip" title="Local OCR confidence ${Number(row.confidence).toFixed(2)}">${Math.round(Number(row.confidence) * 100)}%</span>` : "";
     const verify = row.reviewed
-      ? `<button class="row-verify done" disabled title="This row is already reviewed">${icon("check-circle")}<span>Reviewed</span></button>`
-      : `<button class="row-verify" data-verify="${row.id}" title="Mark this row reviewed" aria-label="Mark roll ${escapeHTML(row.roll || "blank")} reviewed">${icon("check")}<span>Review</span></button>`;
+      ? `<button class="row-verify done" disabled title="This row is already reviewed" aria-label="Already reviewed">${icon("check")}</button>`
+      : `<button class="row-verify" data-verify="${row.id}" title="Mark this row reviewed (R)" aria-label="Mark roll ${escapeHTML(row.roll || "blank")} reviewed" aria-keyshortcuts="R">${icon("check")}</button>`;
     return `<tr data-row="${row.id}" tabindex="0" aria-selected="${row.id === state.selected}" class="${row.id === state.selected ? "selected" : ""}${low ? " low-confidence" : ""}"><td>${escapeHTML(row.roll || "—")}</td><td>${escapeHTML(row.mark || "—")}</td><td><span class="row-status ${row.issues.length ? "needs-review" : row.reviewed ? "reviewed" : ""}" title="${escapeHTML(row.issues.join("; "))}">${escapeHTML(row.status)}</span>${confidence}</td><td>${verify}</td><td><button class="icon-button" data-edit="${row.id}" aria-label="Edit roll ${escapeHTML(row.roll || "blank")}">${icon("edit")}</button></td></tr>`;
   }).join("");
   $("emptyRows").hidden = rows.length > 0;
@@ -619,10 +619,14 @@ window.addEventListener("dragleave",event => { if (!event.relatedTarget) documen
 window.addEventListener("drop",event => { event.preventDefault(); document.body.classList.remove("is-dragging"); if (event.dataTransfer.files.length) importFile(event.dataTransfer.files[0]); });
 document.addEventListener("keydown",event => {
   if (document.querySelector("dialog[open]")) return;
-  const typing = event.target.matches("input,textarea,[contenteditable]");
+  const typing = event.target.matches("input,textarea,select,[contenteditable]");
   if (event.key === "Escape") { state.selection = null; state.drag = null; $("moreMenu").hidden = true; renderPage(); }
   if (event.key === "/" && !typing && state.doc?.status === "ready") { event.preventDefault(); $("searchInput").focus(); }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "e" && state.doc?.status === "ready") { event.preventDefault(); exportFile("xlsx"); }
+  if (event.key.toLowerCase() === "r" && !typing && !event.ctrlKey && !event.metaKey && !event.altKey && state.doc?.status === "ready") {
+    const row = currentRow();
+    if (row && !row.reviewed) { event.preventDefault(); verifyRowById(row.id); }
+  }
 });
 
 async function initialize() {
